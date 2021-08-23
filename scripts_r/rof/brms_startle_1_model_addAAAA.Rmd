@@ -1,0 +1,356 @@
+---
+title: "startle_1_model_addAAAA"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 6
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Time start: `r Sys.time()`
+
+# Load libraries
+```{r echo = FALSE, results = 'hide', include = FALSE}
+# load libraries
+library(ez)
+library(knitr)
+library(dplyr)
+library(lme4)
+library(car)
+library(sjPlot)
+library(rstanarm)
+library(sjstats)
+library(brms)
+library(ggplot2)
+library(gghalves)
+library(ggeffects)
+library(performance)
+library(emmeans)
+
+```
+
+```{r echo = FALSE, results = 'hide', include = FALSE}
+# load functions for this markdown
+
+# select dataframe, based on context and shock; selDf()
+# plot raw data; plot_real_data()
+# plot raw data shock groups collapsed; plot_real_data_ConEff 
+# plot raw data context groups collapsed; plot_real_data_ShockEff 
+# raincloud plot, quick and dirty; plot_data()
+# calculate means; calc_means()
+out_measure <- 'startle'
+
+source('../R_scripts/model_building/analysis/functions_to_load.R')
+source('../R_scripts/model_building/analysis/contrasts_to_load.R')
+source('../R_scripts/plot_context/geom_flat_violin.R')
+```
+
+
+# Load and prepare data
+```{r echo = FALSE, results = 'hide', include = FALSE}
+# non responders and other exclusion criteria are applied here
+pathScr <- '../../BouCon_Context/included_data/included_scr_data.R'
+pathFps <- '../../BouCon_Context/included_data/included_fps_data.R'
+pathRat <- '../../BouCon_Context/included_data/included_rat_data.R'
+
+load(pathScr)
+load(pathFps)
+load(pathRat)
+
+# for SCR and STARTLE first or first two test trials?
+test_trials <- c(1)
+#test_trials <- c(1,2)
+
+#1a.  re-order experimental phases and remove habituation trials
+dscr$expPhase = factor(dscr$expPhase,levels = c('hab', 'acq', 'ext', 'rei', 'tst'),ordered = FALSE)
+dscr$stimType = factor(dscr$stimType,levels = c('csp', 'csm', 'shock'),ordered = FALSE)
+# select trials of interest
+dscr = dscr[(dscr$expPhase == 'ext' & dscr$bin1 == 9) | (dscr$expPhase == 'tst' & dscr$bin1 %in% test_trials), ]
+dscr = droplevels(dscr)
+
+
+# fps
+dfps$numShockRi = factor(dfps$numShockRi, levels = c(0, 1, 4)) # 'zero','one','four'
+dfps$expPhase = factor(dfps$expPhase, levels = c('strlHab', 'hab', 'acq', 'ext', 'rei', 'tst'), ordered = FALSE)
+dfps$stimType = factor(dfps$stimType, levels = c('csp', 'csm', 'iti', 'riBackgr'), ordered = FALSE)
+dfps$bin1     = factor(dfps$bin1)
+dfps$bin2     = factor(dfps$bin2)
+# select trials of interest
+dfps = dfps[(dfps$expPhase == 'ext' & dfps$bin1 == 6) | (dfps$expPhase == 'tst' & dfps$bin1 %in% test_trials), ]
+dfps = droplevels(dfps)
+
+# check GENERALIZED ri without ITIs
+#dfps = droplevels(dfps[dfps$stimType %in% c('csp','csm'),])
+
+# rat
+drat$expPhase = factor(drat$expPhase, levels = c('hab', 'acq', 'ext', 'rei', 'tst'),ordered = FALSE)
+drat$stimType = factor(drat$stimType, levels = c('csp', 'csm', 'RI_background'),ordered = FALSE)
+drat$bin1     = factor(drat$bin1)
+# calculate Z-score within participants
+drat <- drat %>% group_by(idNum) %>%
+  mutate(valueConfZ = scale(valueConf)) %>%
+  data.frame()
+# select trials of interest
+drat = drat[(drat$expPhase == 'ext' & drat$bin1 == 3) | (drat$expPhase == 'tst' & drat$bin1 == 1), ]
+drat = droplevels(drat)
+
+# calculate means per id per phase and stimulus type
+make_summary_phase = function(data_full, col_response, col_response2) {
+  data_summary_phase = data_full %>% group_by(idNum, context, numShockRi, bin1, stimType) %>%
+    summarise(response = mean(eval(as.name(col_response)), na.rm = T),
+              response_raw = mean(eval(as.name(col_response2)), na.rm = T),
+              trial    = ifelse( as.numeric(levels(bin1)[bin1]) > 2, 
+                                 paste0('ext',as.numeric(levels(bin1)[bin1])),
+                                 paste0('tst', as.numeric(levels(bin1)[bin1]))),
+              trial   = as.factor(trial),
+              trial   = relevel(trial, grep('ext', levels(trial)))) %>%
+    data.frame()
+  return(data_summary_phase)
+}
+
+df_scr <- make_summary_phase(dscr, 'amplitude_log_rc', 'amplitude')
+df_fps <- make_summary_phase(dfps, 'amplitude_t', 'amplitude')
+df_rat <- make_summary_phase(drat, 'valueConfZ', 'valueConf')
+```
+
+
+
+The following datasets are loaded: 
+
+SCR:     `r pathScr`  
+Startle: `r pathFps`  
+Ratings: `r pathRat`  
+
+Everything is ready to select subgroups (i.e., context and reinstatement) for plotting and analyses.
+
+# Research question 1
+Try to put everything in one model  
+
+## All at once: Compare AAAB and AABB and AABA and AAAA reinstatement groups and control groups
+
+### Startle
+Define whether raw data or z-transformed data should be used.
+```{r echo=FALSE, warning = FALSE}
+response_var_def <- 'response' # this is tranformed data
+#response_var_def <- 'response_raw' # this is raw data
+
+# method for mixed models, needs to be TRUE when comparing models
+reml_index <- T
+```
+
+Plot raw data, subjects with missing data on single trials are not removed:  
+```{r echo=FALSE, warning = FALSE}
+dr <- selDf(df_fps, cntxt = c('AAAB','AABB', 'AABA','AAAA'), numShocks = c(0,1))
+
+# for CS types only
+#dr <- droplevels(dr[dr$stimType %in% c('csp','csm'),])
+
+dr_means <- calc_means(dr, response_var = 'response')
+
+plot_real_data(dr, response_var = response_var_def)
+```
+
+#### Statistical models
+
+##### RM ANOVA single trial for illustration
+```{r echo=FALSE, warning = FALSE}
+id_w_miss <- unique(dr[is.na(dr[, response_var_def]),'idNum'])
+dat_cc <- dr[!(dr$idNum %in% id_w_miss),] 
+plot_real_data(dat_cc, response_var = response_var_def)
+
+### Type type type!!!
+#### call my more flexible anova function
+ez_code <- ezANOVA_build_code(datafr = 'dat_cc', response_var = response_var_def, within_vars = 'c(trial,stimType)', between_vars = 'c(context, numShockRi)', type_var = '3')
+eval(parse( text = ez_code))
+
+#out_anova <- ezANOVA(dat_cc, dv = eval(substitute(response_var)), within = c(trial, stimType), 
+#                    between = context, wid = idNum)
+#tab_df(out_anova, digits = 3)
+#kable(out_anova, ditits = 3, format = 'markdown')
+```
+
+Note that cases with missing data on at least one trial (n = `r length(id_w_miss)`) are completely removed from the analysis. 
+This causes the pattern in the data to look different.
+
+Testing interactions, type = 3
+`r kable(out_anova, ditits = 3, format = 'markdown')` 
+
+```{r echo=FALSE, warning = FALSE}
+#### call my more flexible anova function
+ez_code <- ezANOVA_build_code(datafr = 'dat_cc', response_var = response_var_def, within_vars = 'c(trial,stimType)', between_vars = 'c(context, numShockRi)', type_var = '2')
+eval(parse( text = ez_code))
+
+```
+
+Testing main effects, type = 2
+`r kable(out_anova, ditits = 3, format = 'markdown')`
+
+##### Mixed linear modeling
+```{r echo=FALSE, warning = FALSE, results = 'hide', include = FALSE}
+# construct models
+# set seed for analyes
+#set.seed()
+seed_def <- 321
+# Define dataframe
+dataFrame <- dr
+
+# Define formula 
+model_formula_0 <- paste0(response_var_def,' ~ 1 + (1| idNum) ')
+model_formula_1 <- paste0(response_var_def,' ~ trial * stimType * context * numShockRi + (1 | idNum)')
+
+# DECIDE ON REML
+## Bayesian, with fixed effects
+#Sys.time()
+fitB0 <- brm(eval(model_formula_1), data = dataFrame, seed = seed_def)
+#fitB5 <- update(fitB0, . ~ . - (1 | idNum) + (1 + stimType * trial | idNum))
+#Sys.time()
+
+fitB1 <- update(fitB0, . ~ . - (1 | idNum) + (1 + stimType | idNum), seed = seed_def)
+fitB2 <- update(fitB0, . ~ . - (1 | idNum) + (1 + trial | idNum), seed = seed_def)
+fitB3 <- update(fitB0, . ~ . - (1 | idNum) + (1 + stimType + trial | idNum), seed = seed_def)
+fitB4 <- update(fitB0, . ~ . - (1 | idNum) + (1 + stimType * trial | idNum), seed = seed_def)
+#Sys.time()
+
+## Bayesian, adjust family
+# fitB1_a <- brm(response ~ stimType * trial * context + (1 | idNum), data = dataFrame)
+# fitB2_a <- brm(response ~ stimType * trial * context + (1 + stimType | idNum), data = dataFrame)
+
+```
+
+
+###### Bayesian
+```{r echo=FALSE, , warning = FALSE}
+# evaluate models
+
+# add criterion to compare
+fitB0 <- add_criterion(fitB0, 'waic')
+fitB1 <- add_criterion(fitB1, 'waic')
+fitB2 <- add_criterion(fitB2, 'waic')
+fitB3 <- add_criterion(fitB3, 'waic')
+fitB4 <- add_criterion(fitB4, 'waic')
+
+compared_fit <- loo_compare(fitB0, fitB1, fitB2, fitB3, fitB4, criterion = 'waic')
+print(compared_fit, digits = 3, simplify = F)
+### CHOOSE WHAT MODEL TO SELECT!
+eval_fit_name <- row.names(compared_fit)[1]
+eval_fit <- eval(parse(text = eval_fit_name))
+```
+
+The model with the best expected predicted accuracy (i.e., best model) is `r eval_fit_name` with model formula:  
+`r paste0(formula(eval_fit)[c(2,1,3)], collapse = ' ')`
+
+Look at the model first and again compare with raw data plotted above.    
+```{r echo=FALSE, warning = FALSE}
+# effects, lets look at model fit first
+vars_to_plot <- c('trial', 'stimType', 'context','numShockRi')
+plot(ggemmeans(eval_fit, vars_to_plot))
+```
+
+Estimates of all models:  
+```{r echo=FALSE, warning = FALSE}
+# estimates
+tab_model(fitB0, fitB1, fitB2, fitB3, fitB4, fitB5)  
+```
+
+Estimates of model 2 graphically displayed:  
+```{r echo=FALSE, warning = FALSE}
+plot_model(eval_fit)
+```
+
+Now look at our effects of interest:  
+```{r echo=FALSE, warning = FALSE}
+# 1. main effect of trial
+c_trial_main <- pairs(emmeans(eval_fit, ~ trial))
+emmeans(eval_fit, ~ trial)
+# calculate confidence intervals with 1.96*sd +- mean
+p1 <- plot(c_trial_main)
+
+# 2. does it depend on group: trial * group (context or shock) interaction
+c_trial_group <- pairs(emmeans(eval_fit, ~ trial * context))
+p2 <- plot(c_trial_group)
+
+c_trial_group_2 <- pairs(emmeans(eval_fit, ~ trial * numShockRi))
+p2b <- plot(c_trial_group_2)
+
+c_trial_group_3 <- pairs(emmeans(eval_fit, ~ trial * context * numShockRi))
+p2c <- plot(c_trial_group_3)
+
+
+# 3. trial * stimType interaction
+c_trial_stimType <- pairs(emmeans(eval_fit, ~ trial * stimType))
+p3 <- plot(c_trial_stimType)
+
+# 4. does it depend on group: trial * stimType * group (context or shock) interaction 
+c_trial_stimType_group <- pairs(emmeans(eval_fit, ~ trial * stimType * context))
+p4 <- plot(c_trial_stimType_group)
+
+# 4. does it depend on group: trial * stimType * group (context or shock) interaction 
+c_trial_stimType_group_2 <- pairs(emmeans(eval_fit, ~ trial * stimType * numShockRi))
+p4b <- plot(c_trial_stimType_group_2)
+
+# 4. does it depend on group: trial * stimType * group (context or shock) interaction 
+c_trial_stimType_group_3 <- pairs(emmeans(eval_fit, ~ trial * stimType * context * numShockRi))
+p4c <- plot(c_trial_stimType_group_3)
+```
+
+Plot estimates of effects of interest,all:  
+
+Main effect of trial  
+```{r echo=FALSE, warning = FALSE}
+p1  
+```
+
+Does this depend on group? Interaction trial x group (context)  
+```{r echo=FALSE, warning = FALSE}
+p2  
+```
+
+Does this depend on group? Interaction trial x group (numShockRi)  
+```{r echo=FALSE, warning = FALSE}
+p2b  
+```
+
+Does this depend on group? Interaction trial x group (context) x group (numShockRi) 
+```{r echo=FALSE, warning = FALSE}
+#p2c  
+#plot(c_trial_group_3[c(6,17,27,36,44,51)])
+con_index_1 <- c_trial_group_3@levels[["contrast"]] %in% contrasts_of_interest_1
+plot(c_trial_group_3[con_index_1] )
+```
+
+Differential reinstatement effect? Interaction trial x stimType    
+```{r echo=FALSE, warning = FALSE}
+p3  
+```
+
+Does this depend on group? Interaction trial x stimType x context  
+```{r echo=FALSE, warning = FALSE}
+p4  
+```
+
+Does this depend on group? Interaction trial x stimType x numShockRi  
+```{r echo=FALSE, warning = FALSE}
+p4b  
+```
+
+Does this depend on group? Interaction trial x stimType x context x numShockRi  
+```{r echo=FALSE, warning = FALSE}
+#p4c  
+#plot(c_trial_stimType_group_3[c(6,29,51,72,92,111,216,227,237,246,254,261)])
+con_index_2 <- c_trial_stimType_group_3@levels[["contrast"]] %in% contrasts_of_interest_2
+plot(c_trial_stimType_group_3[con_index_2] )
+```
+
+CS differences per trial (i.e., within extinction, within test)
+```{r echo=FALSE, warning = FALSE}
+#plot(c_trial_stimType_group_3[c(12,34,55,78,98,117,135,152,168,183,197,210)])
+con_index_3 <- c_trial_stimType_group_3@levels[["contrast"]] %in% contrasts_of_interest_3
+plot(c_trial_stimType_group_3[con_index_3] )
+```
+
+Time finished: `r Sys.time()`
